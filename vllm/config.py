@@ -281,7 +281,11 @@ class ModelConfig:
                    total_num_kv_heads // parallel_config.tensor_parallel_size)
 
     def get_num_layers(self, parallel_config: "ParallelConfig") -> int:
-        total_num_hidden_layers = self.hf_config.num_hidden_layers + 1
+        total_num_hidden_layers = self.hf_config.num_hidden_layers
+        # deal with special case internlm3
+        if self.hf_config.architectures[0] == 'InternLM3ForCausalLM':
+            total_num_hidden_layers += 1
+        
         return total_num_hidden_layers // parallel_config.pipeline_parallel_size
 
 

@@ -7,7 +7,7 @@ from transformers import PretrainedConfig
 from vllm._C import cache_ops
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.attention import PagedAttention, PagedCrossAttention
+from vllm.model_executor.layers.attention import PagedAttention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (LinearMethodBase,
                                                MergedColumnParallelLinear,
@@ -193,7 +193,7 @@ class InternLM3CrossAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
-        self.attn = PagedCrossAttention(self.num_heads,
+        self.attn = PagedAttention(self.num_heads,
                                    self.head_dim,
                                    self.scaling,
                                    num_kv_heads=self.num_kv_heads)
@@ -208,8 +208,7 @@ class InternLM3CrossAttention(nn.Module):
         value_states: Optional[torch.Tensor],
     ) -> torch.Tensor:
         q, _ = self.wq(hidden_states)
-        tmp_key = hidden_states.new_empty(hidden_states.shape[0], self.num_kv_heads * self.head_dim)
-        q, _ = self.rotary_emb(positions, q, tmp_key)
+        q, _ = self.rotary_emb(positions, q)
         k_cache, v_cache = kv_cache
         attn_output = self.attn(q, key_states, value_states, k_cache, v_cache, input_metadata)
         output, _ = self.wo(attn_output)
@@ -401,13 +400,14 @@ class InternLM3CrossDecoder(nn.Module):
 
         key_states, _ = self.wk(hidden_states_norm)
         value_states, _ = self.wv(hidden_states_norm)
-        tmp_query = hidden_states.new_empty(hidden_states.shape[0], self.num_heads * self.head_dim)
-        _, key_states = self.rotary_emb(positions, tmp_query, key_states)
+        key_states, _ = self.rotary_emb(positions, key_states)
         key_states = key_states.view(-1, self.num_kv_heads, self.head_dim)
         value_states = value_states.view(-1, self.num_kv_heads, self.head_dim)
         shared_kv_cache = kv_caches[-1]
+        # if not in profile_run
         if shared_kv_cache[0] is not None:
             key_cache, value_cache = shared_kv_cache
+            # cache kv outside attn
             cache_ops.reshape_and_cache(
                 key_states,
                 value_states,
