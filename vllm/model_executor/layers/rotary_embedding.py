@@ -136,12 +136,16 @@ class RotaryEmbedding(nn.Module):
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
-        key: torch.Tensor,
+        key: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # ops.rotary_embedding() is an in-place operation that
         # updates the query and key tensors.
-        ops.rotary_embedding(positions, query, key, self.head_size,
-                             self.cos_sin_cache, self.is_neox_style)
+        if key is None:
+            ops.rotary_embedding_single(positions, query, self.head_size,
+                                self.cos_sin_cache, self.is_neox_style)
+        else:
+            ops.rotary_embedding(positions, query, key, self.head_size,
+                                self.cos_sin_cache, self.is_neox_style)
         return query, key
 
 

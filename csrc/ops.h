@@ -53,6 +53,13 @@ void rotary_embedding(
   torch::Tensor& cos_sin_cache,
   bool is_neox);
 
+void rotary_embedding_single(
+  torch::Tensor& positions,
+  torch::Tensor& query,
+  int head_size,
+  torch::Tensor& cos_sin_cache,
+  bool is_neox);
+
 void silu_and_mul(
   torch::Tensor& out,
   torch::Tensor& input);
