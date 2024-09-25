@@ -66,9 +66,9 @@ class InternLM3SelfAttention(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        rope_theta: float = 10000,
+        rope_theta: float = 1000000,
         rope_scaling: Optional[Dict[str, Any]] = None,
-        max_position_embeddings: int = 8192,
+        max_position_embeddings: int = 32768,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
@@ -145,9 +145,9 @@ class InternLM3CrossAttention(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        rope_theta: float = 10000,
+        rope_theta: float = 1000000,
         rope_scaling: Optional[Dict[str, Any]] = None,
-        max_position_embeddings: int = 8192,
+        max_position_embeddings: int = 32768,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
@@ -226,10 +226,10 @@ class InternLM3DecoderLayer(nn.Module):
         super().__init__()
         self.is_cross_decoder = is_cross_decoder
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings",
-                                          8192)
+                                          32768)
         if is_cross_decoder:
             self.attention = InternLM3CrossAttention(
                 hidden_size=self.hidden_size,
@@ -386,7 +386,6 @@ class InternLM3CrossDecoder(nn.Module):
             base=config.rope_theta,
             rope_scaling=config.rope_scaling,
         )
-        self.kv_cache_dtype = 'auto'
   
     def forward(
         self,
