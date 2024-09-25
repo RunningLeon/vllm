@@ -7,7 +7,8 @@ from transformers import PretrainedConfig
 from vllm._C import cache_ops
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.attention import PagedAttention
+from vllm.model_executor.layers.attention import (PagedAttention,
+                                                  PagedCrossAttention)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (LinearMethodBase,
                                                MergedColumnParallelLinear,
@@ -193,7 +194,7 @@ class InternLM3CrossAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
-        self.attn = PagedAttention(self.num_heads,
+        self.attn = PagedCrossAttention(self.num_heads,
                                    self.head_dim,
                                    self.scaling,
                                    num_kv_heads=self.num_kv_heads)
@@ -366,7 +367,6 @@ class InternLM3CrossDecoder(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.key_value_groups = int(self.num_heads / self.num_kv_heads)
-
         self.wk = ColumnParallelLinear(self.hidden_size, 
                                        self.total_num_kv_heads * self.head_dim, 
                                        bias=config.bias,
@@ -400,11 +400,13 @@ class InternLM3CrossDecoder(nn.Module):
         key_states, _ = self.wk(hidden_states_norm)
         value_states, _ = self.wv(hidden_states_norm)
         key_states, _ = self.rotary_emb(positions, key_states)
-        key_states = key_states.view(-1, self.num_kv_heads, self.head_dim)
-        value_states = value_states.view(-1, self.num_kv_heads, self.head_dim)
+        pre_hidden_states = None
+        pre_residule = None
         shared_kv_cache = kv_caches[-1]
         # if not in profile_run
         if shared_kv_cache[0] is not None:
+            key_states = key_states.view(-1, self.num_kv_heads, self.head_dim)
+            value_states = value_states.view(-1, self.num_kv_heads, self.head_dim)
             key_cache, value_cache = shared_kv_cache
             # cache kv outside attn
             cache_ops.reshape_and_cache(
@@ -415,8 +417,16 @@ class InternLM3CrossDecoder(nn.Module):
                 input_metadata.slot_mapping.flatten(),
                 input_metadata.kv_cache_dtype,
             )
+            
             if input_metadata.is_prompt:
+                batch_indices = torch.arange(hidden_states.shape[0], device=key_states.device)
+                last_token_indices = input_metadata.prompt_lens - 1
+                positions = last_token_indices[:, None]
+                pre_hidden_states = hidden_states
+                pre_residule = residual
                 shared_kv_cache = (None, None)
+                hidden_states = hidden_states[batch_indices, last_token_indices, :].unsqueeze(1)
+                residual = residual[batch_indices, last_token_indices, :].unsqueeze(1)
             else:
                 key_states = None
                 value_states = None
@@ -431,6 +441,14 @@ class InternLM3CrossDecoder(nn.Module):
                 key_states=key_states,
                 value_states=value_states
             )
+        
+        if pre_hidden_states is not None:
+            batch_indices = torch.arange(hidden_states.shape[0], device=key_states.device)
+            last_token_indices = input_metadata.prompt_lens - 1
+            pre_hidden_states[batch_indices, last_token_indices, :] = hidden_states.squeeze(1)
+            pre_residule[batch_indices, last_token_indices, :] = residual.squeeze(1)
+            hidden_states = pre_hidden_states
+            residual = pre_residule
         return hidden_states, residual
     
 
