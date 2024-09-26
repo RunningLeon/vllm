@@ -345,7 +345,7 @@ class InternLM3CrossDecoder(nn.Module):
             InternLM3DecoderLayer(config, linear_method, is_cross_decoder=True)
             for _ in range(config.num_hidden_layers)
         ])
-
+        self.sliding_window = self.layers[0].attention.attn.sliding_window
         self.tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = config.num_attention_heads
         self.total_num_kv_heads = config.num_key_value_heads
@@ -396,7 +396,6 @@ class InternLM3CrossDecoder(nn.Module):
         residual: Optional[torch.Tensor] = None):
 
         hidden_states_norm, residual = self.norm(hidden_states,  residual)
-
         key_states, _ = self.wk(hidden_states_norm)
         value_states, _ = self.wv(hidden_states_norm)
         key_states, _ = self.rotary_emb(positions, key_states)
@@ -419,8 +418,10 @@ class InternLM3CrossDecoder(nn.Module):
             )
             
             if input_metadata.is_prompt:
-                batch_indices = torch.arange(hidden_states.shape[0], device=key_states.device)
-                last_token_indices = input_metadata.prompt_lens - 1
+                # slice hiddenstates of last tokens
+                input_metadata.attn_bias = input_metadata.last_token_attn_bias
+                last_token_indices = input_metadata.last_token_indices
+                batch_indices = input_metadata.batch_indices
                 positions = last_token_indices[:, None]
                 pre_hidden_states = hidden_states
                 pre_residule = residual
@@ -441,16 +442,18 @@ class InternLM3CrossDecoder(nn.Module):
                 key_states=key_states,
                 value_states=value_states
             )
-        
-        if pre_hidden_states is not None:
-            batch_indices = torch.arange(hidden_states.shape[0], device=key_states.device)
-            last_token_indices = input_metadata.prompt_lens - 1
-            pre_hidden_states[batch_indices, last_token_indices, :] = hidden_states.squeeze(1)
-            pre_residule[batch_indices, last_token_indices, :] = residual.squeeze(1)
-            hidden_states = pre_hidden_states
-            residual = pre_residule
+
+        # uncomment if sampling_metadata.selected_token_indices is not updated in model_runner.py
+        # if pre_hidden_states is not None:
+        #     # update hidden states of last tokens
+        #     batch_indices = input_metadata.batch_indices
+        #     last_token_indices = input_metadata.last_token_indices
+        #     pre_hidden_states[batch_indices, last_token_indices, :] = hidden_states.squeeze(1)
+        #     pre_residule[batch_indices, last_token_indices, :] = residual.squeeze(1)
+        #     hidden_states = pre_hidden_states
+        #     residual = pre_residule
         return hidden_states, residual
-    
+
 
 class InternLM3Model(nn.Module):
 
@@ -479,12 +482,32 @@ class InternLM3Model(nn.Module):
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
+        """forward"""
+        if kv_caches[0][0] is not None and input_metadata.is_prompt:
+            input_metadata = self._update_metadata(input_ids, input_metadata)
+
         hidden_states = self.tok_embeddings(input_ids)
         residual = None
         hidden_states, residual = self.self_decoder(positions, hidden_states, kv_caches, input_metadata, residual)
         hidden_states, residual = self.cross_decoder(positions, hidden_states, kv_caches, input_metadata, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
+
+    def _update_metadata(self, input_ids: torch.Tensor, input_metadata: InputMetadata):
+        """update metadata for slice last tokens in prefill stages"""
+        from xformers.ops.fmha.attn_bias import BlockDiagonalCausalMask
+        batch_size = input_ids.size(0)
+        batch_indices = torch.arange(batch_size, device=input_ids.device)
+        last_token_indices = input_metadata.prompt_lens - 1
+        last_token_attn_bias = BlockDiagonalCausalMask.from_seqlens(
+            [1] * batch_size, [input_metadata.max_seq_len] * batch_size)
+        if self.cross_decoder.sliding_window is not None:
+            attn_bias = attn_bias.make_local_attention(
+                self.cross_decoder.sliding_window)
+        input_metadata.last_token_attn_bias = last_token_attn_bias
+        input_metadata.batch_indices = batch_indices
+        input_metadata.last_token_indices = last_token_indices
+        return input_metadata
 
 
 class InternLM3ForCausalLM(nn.Module):
