@@ -586,10 +586,10 @@ class ModelRunner:
             input_metadata=input_metadata,
         )
         # update selected_token_indices of sliced hidden states for InternLM3ForCausalLM 
-        if kv_caches[0][0] is not None and self.model_config.hf_config.architectures[0] == 'InternLM3ForCausalLM' and input_metadata.is_prompt:
-            selected_token_indices = torch.arange(sampling_metadata.num_prompts,
-                                                  device=hidden_states.device)
-            sampling_metadata.selected_token_indices = selected_token_indices
+        # if kv_caches[0][0] is not None and self.model_config.hf_config.architectures[0] == 'InternLM3ForCausalLM' and input_metadata.is_prompt:
+        #     selected_token_indices = torch.arange(sampling_metadata.num_prompts,
+        #                                           device=hidden_states.device)
+            # sampling_metadata.selected_token_indices = selected_token_indices
         # Sample the next token.
         output = self.model.sample(
             hidden_states=hidden_states,

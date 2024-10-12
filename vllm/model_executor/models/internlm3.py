@@ -399,6 +399,10 @@ class InternLM3CrossDecoder(nn.Module):
         key_states, _ = self.wk(hidden_states_norm)
         value_states, _ = self.wv(hidden_states_norm)
         key_states, _ = self.rotary_emb(positions, key_states)
+        
+        # this is a flag to enable only compute last tokens in prefill stages,
+        # TODO support it in next commit
+        only_compute_last_tokens = False
         pre_hidden_states = None
         pre_residule = None
         shared_kv_cache = kv_caches[-1]
@@ -418,16 +422,23 @@ class InternLM3CrossDecoder(nn.Module):
             )
             
             if input_metadata.is_prompt:
+                # use k/v in first prefill stages
+                if input_metadata.block_tables.numel() == 0:
+                    shared_kv_cache = (None, None)
+                else:
+                    key_states = None
+                    value_states = None
                 # slice hiddenstates of last tokens
-                input_metadata.attn_bias = input_metadata.last_token_attn_bias
-                last_token_indices = input_metadata.last_token_indices
-                batch_indices = input_metadata.batch_indices
-                positions = last_token_indices[:, None]
-                pre_hidden_states = hidden_states
-                pre_residule = residual
-                shared_kv_cache = (None, None)
-                hidden_states = hidden_states[batch_indices, last_token_indices, :].unsqueeze(1)
-                residual = residual[batch_indices, last_token_indices, :].unsqueeze(1)
+                if only_compute_last_tokens:
+                    input_metadata.attn_bias = input_metadata.last_token_attn_bias
+                    last_token_indices = input_metadata.last_token_indices
+                    batch_indices = input_metadata.batch_indices
+                    positions = last_token_indices[:, None]
+                    pre_hidden_states = hidden_states
+                    pre_residule = residual
+                    only_compute_last_tokens
+                    hidden_states = hidden_states[batch_indices, last_token_indices, :].unsqueeze(1)
+                    residual = residual[batch_indices, last_token_indices, :].unsqueeze(1)
             else:
                 key_states = None
                 value_states = None
@@ -444,14 +455,14 @@ class InternLM3CrossDecoder(nn.Module):
             )
 
         # uncomment if sampling_metadata.selected_token_indices is not updated in model_runner.py
-        # if pre_hidden_states is not None:
-        #     # update hidden states of last tokens
-        #     batch_indices = input_metadata.batch_indices
-        #     last_token_indices = input_metadata.last_token_indices
-        #     pre_hidden_states[batch_indices, last_token_indices, :] = hidden_states.squeeze(1)
-        #     pre_residule[batch_indices, last_token_indices, :] = residual.squeeze(1)
-        #     hidden_states = pre_hidden_states
-        #     residual = pre_residule
+        if only_compute_last_tokens:
+            # update hidden states of last tokens
+            batch_indices = input_metadata.batch_indices
+            last_token_indices = input_metadata.last_token_indices
+            pre_hidden_states[batch_indices, last_token_indices, :] = hidden_states.squeeze(1)
+            pre_residule[batch_indices, last_token_indices, :] = residual.squeeze(1)
+            hidden_states = pre_hidden_states
+            residual = pre_residule
         return hidden_states, residual
 
 
