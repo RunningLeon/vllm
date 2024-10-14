@@ -7,6 +7,7 @@ import torch.nn as nn
 from xformers import ops as xops
 from xformers.ops.fmha.attn_bias import (BlockDiagonalCausalMask,
                                          LowerTriangularMaskWithTensorBias)
+from flash_attn import flash_attn_varlen_func
 
 from vllm._C import ops
 from vllm._C import cache_ops
@@ -276,70 +277,91 @@ class PagedCrossAttention(PagedAttention):
             # normal attention
             if (key_cache is None or value_cache is None
                     or input_metadata.block_tables.numel() == 0):
-                if self.num_kv_heads != self.num_heads:
-                    # As of Nov 2023, xformers only supports MHA. For MQA/GQA,
-                    # project the key and value tensors to the desired number of
-                    # heads.
-                    # TODO(woosuk): Use MQA/GQA kernels for higher performance.
-                    query = query.view(query.shape[0], self.num_kv_heads,
-                                       self.num_queries_per_kv,
-                                       query.shape[-1])
-                    key = key[:, :,
-                              None, :].expand(key.shape[0], self.num_kv_heads,
-                                              self.num_queries_per_kv,
-                                              key.shape[-1])
-                    value = value[:, :,
-                                  None, :].expand(value.shape[0],
-                                                  self.num_kv_heads,
-                                                  self.num_queries_per_kv,
-                                                  value.shape[-1])
-                # Set attention bias if not provided. This typically happens at
-                # the very attention layer of every iteration.
-                # FIXME(woosuk): This is a hack.
-                if input_metadata.attn_bias is None:
-                    if self.alibi_slopes is None:
-                        attn_bias = BlockDiagonalCausalMask.from_seqlens(
-                            [seq_len] * batch_size)
-                        if self.sliding_window is not None:
-                            attn_bias = attn_bias.make_local_attention(
-                                self.sliding_window)
-                        input_metadata.attn_bias = attn_bias
-                    else:
-                        input_metadata.attn_bias = _make_alibi_bias(
-                            self.alibi_slopes, self.num_kv_heads, batch_size,
-                            seq_len, query.dtype)
+                # use xformers when query and key has same seq len
+                if query.shape[0] == key.shape[0]:
+                    if self.num_kv_heads != self.num_heads:
+                        # As of Nov 2023, xformers only supports MHA. For MQA/GQA,
+                        # project the key and value tensors to the desired number of
+                        # heads.
+                        # TODO(woosuk): Use MQA/GQA kernels for higher performance.
+                        query = query.view(query.shape[0], self.num_kv_heads,
+                                        self.num_queries_per_kv,
+                                        query.shape[-1])
+                        key = key[:, :,
+                                None, :].expand(key.shape[0], self.num_kv_heads,
+                                                self.num_queries_per_kv,
+                                                key.shape[-1])
+                        value = value[:, :,
+                                    None, :].expand(value.shape[0],
+                                                    self.num_kv_heads,
+                                                    self.num_queries_per_kv,
+                                                    value.shape[-1])
+                    # Set attention bias if not provided. This typically happens at
+                    # the very attention layer of every iteration.
+                    # FIXME(woosuk): This is a hack.
+                    if input_metadata.attn_bias is None:
+                        if self.alibi_slopes is None:
+                            attn_bias = BlockDiagonalCausalMask.from_seqlens(
+                                [seq_len] * batch_size)
+                            if self.sliding_window is not None:
+                                attn_bias = attn_bias.make_local_attention(
+                                    self.sliding_window)
+                            input_metadata.attn_bias = attn_bias
+                        else:
+                            input_metadata.attn_bias = _make_alibi_bias(
+                                self.alibi_slopes, self.num_kv_heads, batch_size,
+                                seq_len, query.dtype)
 
-                if self.use_ref_attention:
-                    output = self.ref_masked_attention(
+                    if self.use_ref_attention:
+                        output = self.ref_masked_attention(
+                            query,
+                            key,
+                            value,
+                        )
+                        # Using view got RuntimeError: view size is not compatible with input tensor's size and stride
+                        # (at least one dimension spans across two contiguous subspaces). Use reshape instead
+                        return output.reshape(batch_size, seq_len, hidden_size)
+
+                    # TODO(woosuk): Too many view operations. Let's try to reduce
+                    # them in the future for code readability.
+                    if self.alibi_slopes is None:
+                        query = query.unsqueeze(0)
+                        key = key.unsqueeze(0)
+                        value = value.unsqueeze(0)
+                    else:
+                        query = query.unflatten(0, (batch_size, seq_len))
+                        key = key.unflatten(0, (batch_size, seq_len))
+                        value = value.unflatten(0, (batch_size, seq_len))
+
+                    out = xops.memory_efficient_attention_forward(
                         query,
                         key,
                         value,
+                        attn_bias=input_metadata.attn_bias,
+                        p=0.0,
+                        scale=self.scale,
+                        op=xops.fmha.MemoryEfficientAttentionFlashAttentionOp[0] if
+                        (is_hip()) else None,
                     )
-                    # Using view got RuntimeError: view size is not compatible with input tensor's size and stride
-                    # (at least one dimension spans across two contiguous subspaces). Use reshape instead
-                    return output.reshape(batch_size, seq_len, hidden_size)
-
-                # TODO(woosuk): Too many view operations. Let's try to reduce
-                # them in the future for code readability.
-                if self.alibi_slopes is None:
-                    query = query.unsqueeze(0)
-                    key = key.unsqueeze(0)
-                    value = value.unsqueeze(0)
                 else:
-                    query = query.unflatten(0, (batch_size, seq_len))
-                    key = key.unflatten(0, (batch_size, seq_len))
-                    value = value.unflatten(0, (batch_size, seq_len))
+                    # use flash attn
+                    window_size = (-1, -1) 
+                    if self.sliding_window is not None:
+                        window_size = (self.sliding_window, self.sliding_window)
+                    out = flash_attn_varlen_func(query,
+                                                 key,
+                                                 value,
+                                                 input_metadata.cu_seqlens_q,
+                                                 input_metadata.cu_seqlens_k,
+                                                 input_metadata.max_seqlen_q,
+                                                 input_metadata.max_seqlen_k,
+                                                 dropout_p=0.0,
+                                                 softmax_scale=self.scale,
+                                                 causal=True,
+                                                 alibi_slopes=self.alibi_slopes,
+                                                 window_size=window_size
+                                                 )
 
-                out = xops.memory_efficient_attention_forward(
-                    query,
-                    key,
-                    value,
-                    attn_bias=input_metadata.attn_bias,
-                    p=0.0,
-                    scale=self.scale,
-                    op=xops.fmha.MemoryEfficientAttentionFlashAttentionOp[0] if
-                    (is_hip()) else None,
-                )
                 output = out.view_as(query)
             else:
                 # prefix-enabled attention

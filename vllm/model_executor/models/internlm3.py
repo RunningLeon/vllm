@@ -400,9 +400,8 @@ class InternLM3CrossDecoder(nn.Module):
         value_states, _ = self.wv(hidden_states_norm)
         key_states, _ = self.rotary_emb(positions, key_states)
         
-        # this is a flag to enable only compute last tokens in prefill stages,
-        # TODO support it in next commit
-        only_compute_last_tokens = False
+        # this is a flag to enable only compute last tokens in prefilling stage
+        only_compute_last_tokens = True
         pre_hidden_states = None
         pre_residule = None
         shared_kv_cache = kv_caches[-1]
@@ -425,18 +424,19 @@ class InternLM3CrossDecoder(nn.Module):
                 # use k/v in first prefill stages
                 if input_metadata.block_tables.numel() == 0:
                     shared_kv_cache = (None, None)
+                    if only_compute_last_tokens:
+                        key_states = key_states[input_metadata.valid_token_indices]
+                        value_states = value_states[input_metadata.valid_token_indices]
                 else:
                     key_states = None
                     value_states = None
                 # slice hiddenstates of last tokens
                 if only_compute_last_tokens:
-                    input_metadata.attn_bias = input_metadata.last_token_attn_bias
                     last_token_indices = input_metadata.last_token_indices
                     batch_indices = input_metadata.batch_indices
                     positions = last_token_indices[:, None]
                     pre_hidden_states = hidden_states
                     pre_residule = residual
-                    only_compute_last_tokens
                     hidden_states = hidden_states[batch_indices, last_token_indices, :].unsqueeze(1)
                     residual = residual[batch_indices, last_token_indices, :].unsqueeze(1)
             else:
@@ -455,7 +455,7 @@ class InternLM3CrossDecoder(nn.Module):
             )
 
         # uncomment if sampling_metadata.selected_token_indices is not updated in model_runner.py
-        if only_compute_last_tokens:
+        if only_compute_last_tokens and pre_hidden_states is not None:
             # update hidden states of last tokens
             batch_indices = input_metadata.batch_indices
             last_token_indices = input_metadata.last_token_indices
@@ -507,17 +507,27 @@ class InternLM3Model(nn.Module):
     def _update_metadata(self, input_ids: torch.Tensor, input_metadata: InputMetadata):
         """update metadata for slice last tokens in prefill stages"""
         from xformers.ops.fmha.attn_bias import BlockDiagonalCausalMask
-        batch_size = input_ids.size(0)
-        batch_indices = torch.arange(batch_size, device=input_ids.device)
+        batch_size, seqlen  = input_ids.shape
+        device = input_ids.device
+        batch_indices = torch.arange(batch_size, device=device, dtype=torch.int32)
         last_token_indices = input_metadata.prompt_lens - 1
-        last_token_attn_bias = BlockDiagonalCausalMask.from_seqlens(
-            [1] * batch_size, [input_metadata.max_seq_len] * batch_size)
-        if self.cross_decoder.sliding_window is not None:
-            attn_bias = attn_bias.make_local_attention(
-                self.cross_decoder.sliding_window)
-        input_metadata.last_token_attn_bias = last_token_attn_bias
         input_metadata.batch_indices = batch_indices
         input_metadata.last_token_indices = last_token_indices
+
+        # prepare some inputs for flash_attn_varlen_func
+        zero = batch_indices.new_zeros(1)
+        cu_seqlens_q = torch.cat([zero, batch_indices + 1], dim=0).to(dtype=torch.int32)
+        cu_seqlens_k = torch.cat([zero, input_metadata.prompt_lens.cumsum(dim=0)], dim=0).to(dtype=torch.int32)
+        input_metadata.cu_seqlens_q = cu_seqlens_q
+        input_metadata.cu_seqlens_k = cu_seqlens_k
+        input_metadata.max_seqlen_q = 1
+        input_metadata.max_seqlen_k = seqlen
+        # token indices of unpadded
+        valid_token_indices = [torch.arange(l, device=device) + i * seqlen for i, l in enumerate(input_metadata.prompt_lens)]
+        valid_token_indices = torch.cat(valid_token_indices, dim=0)
+        input_metadata.valid_token_indices = valid_token_indices
+
+
         return input_metadata
 
 
